@@ -25,6 +25,7 @@ runs *inside* the game process instead, on both of the layers that matter:
 | --- | --- |
 | D3D9 | `IDirect3D9::CreateDevice` and `IDirect3DDevice9::Reset` are intercepted; `D3DPRESENT_PARAMETERS.Windowed` is forced to `TRUE` and the backbuffer sized to the monitor, so the game never takes exclusive fullscreen. |
 | Win32 | The game window is subclassed. Style changes, position changes and non-client frame calculation are overridden as they happen, so the game's attempts to restore its own frame never take visible effect. |
+| Keyboard | A `WH_KEYBOARD_LL` hook restores the plain Win key (opens Start menu) and Alt+F4 (closes the game), both of which Windows suppresses when a `WS_POPUP` window covers the full monitor. Alt+Tab works without intervention. Win+key combinations are not supported. |
 
 ### Verified against this install
 
@@ -124,10 +125,12 @@ other process owns the display in exclusive fullscreen — very likely Dishonore
 itself — and D3D9 will not create a second device until it lets go. Close it and
 re-run. This is not a proxy fault; a plain unproxied D3D9 app fails the same way.
 
-**The Windows key does nothing in-game.** Expected, and not a windowing problem.
-Dishonored acquires the keyboard through DirectInput8, which suppresses the
-Windows logo key when a device is acquired exclusively — the same in windowed
-mode as in fullscreen. Alt+Tab is unaffected. See FINDINGS.md §6.
+**Win key and Alt+F4 don't work in-game.** When a `WS_POPUP` window covers
+the full monitor, Windows suppresses shell hotkeys. The mod installs a
+low-level keyboard hook that restores the plain Win key (opens Start menu)
+and Alt+F4 (closes the game). Win+key combinations are swallowed to avoid
+side effects. Alt+Tab works without any intervention. If these still don't
+work, check `DishonoredBorderless.log` for `installed low-level keyboard hook`.
 
 **It goes borderless, then reverts.** Set `LogLevel=debug` and look for repeated
 `style ... -> ...` / `enforced rect` lines. That is the watchdog fighting
@@ -175,7 +178,9 @@ Their correctness is asserted only by `Verify-Borderless.ps1` passing.
 
 Implemented: plan.md 4.2 (D3D9 proxy), 4.3 (WndProc hook), 4.6 (all three
 contingencies — watchdog fallback, re-attach on window recreation, and
-`EnableWndProcHook=0` / `Enabled=0` to disable either layer).
+`EnableWndProcHook=0` / `Enabled=0` to disable either layer), plus a
+`WH_KEYBOARD_LL` hook that restores the plain Win key (Start menu) and Alt+F4,
+which Windows suppresses when a `WS_POPUP` window covers the full monitor.
 
 Not implemented: plan.md 4.4's optional GUI or CLI settings editor — the `.ini`
 is edited directly. Reading resolution back out of the game's own configs is not
@@ -214,7 +219,9 @@ sessions:
   game auto-opens its pause menu on focus loss, which is the game's own
   behaviour.
 
-Still unmeasured: input latency and raw mouse capture (plan.md 4.5.3).
+Still unmeasured: input latency and raw mouse capture (plan.md 4.5.3). The
+keyboard hook adds a negligible per-keystroke cost (one `FindWindowW` +
+`PostThreadMessage`) that should not be perceptible.
 
 ## Release
 

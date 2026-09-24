@@ -13,8 +13,133 @@ static BOOL    g_unicode   = TRUE;
 static LONG    g_enforcing = 0;   // guards re-entry via WM_SIZE/WM_WINDOWPOSCHANGING
 static HANDLE  g_watchdog  = NULL;
 static HANDLE  g_stopEvent = NULL;
+static HHOOK   g_kbHook    = NULL;
 
 static LRESULT CALLBACK BorderlessWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
+
+// ---------------------------------------------------------------------------
+// DWM hints (cosmetic)
+// ---------------------------------------------------------------------------
+
+typedef HRESULT(WINAPI* PFN_DwmSetWindowAttribute)(HWND, DWORD, LPCVOID, DWORD);
+
+// Spelled out to avoid an SDK version dependency.
+#define DBL_DWMWA_TRANSITIONS_FORCEDISABLED  3
+#define DBL_DWMWA_EXCLUDED_FROM_PEEK         12
+
+static void ApplyDwmHints(HWND hwnd)
+{
+    HMODULE dwmapi = GetModuleHandleA("dwmapi.dll");
+    if (!dwmapi) dwmapi = LoadLibraryA("dwmapi.dll");
+    if (!dwmapi) return;
+
+    PFN_DwmSetWindowAttribute fn =
+        (PFN_DwmSetWindowAttribute)GetProcAddress(dwmapi, "DwmSetWindowAttribute");
+    if (!fn) return;
+
+    // Suppress the fullscreen-entry fade animation.
+    BOOL val = TRUE;
+    fn(hwnd, DBL_DWMWA_TRANSITIONS_FORCEDISABLED, &val, sizeof(val));
+
+    // Keep Aero Peek working normally when the taskbar is in use.
+    val = FALSE;
+    fn(hwnd, DBL_DWMWA_EXCLUDED_FROM_PEEK, &val, sizeof(val));
+
+    LOGI("applied DWM hints to window %x", (unsigned)(UINT_PTR)hwnd);
+}
+
+// ---------------------------------------------------------------------------
+// Shell hotkey recovery (plan.md 4.3)
+// ---------------------------------------------------------------------------
+
+// A WS_POPUP window that exactly covers a monitor causes Windows to suppress
+// shell hotkeys for it, even in windowed mode. A WH_KEYBOARD_LL hook fires
+// before that suppression is applied, so we can intercept the affected keys
+// and handle them ourselves.
+//
+// Restored: plain Win tap (Start menu via SC_TASKLIST), Alt+F4 (SC_CLOSE).
+// Alt+Tab is unaffected and needs no intervention.
+//
+// Win+key combinations are swallowed. Forwarding them to the shell requires
+// undocumented message IDs that differ between Windows versions, so the only
+// safe option is to discard them -- leaving them through would produce
+// phantom-key side effects inside the game.
+
+static LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam)
+{
+    if (code != HC_ACTION)
+        return CallNextHookEx(g_kbHook, code, wParam, lParam);
+
+    KBDLLHOOKSTRUCT* kb = (KBDLLHOOKSTRUCT*)lParam;
+
+    // Skip keystrokes we injected ourselves (avoids infinite loop).
+    if (kb->flags & LLKHF_INJECTED)
+        return CallNextHookEx(g_kbHook, code, wParam, lParam);
+
+    const BOOL keyUp     = (wParam == WM_KEYUP || wParam == WM_SYSKEYUP);
+    const BOOL gameFocus = (GetForegroundWindow() == g_hwnd);
+
+    if (!gameFocus)
+        return CallNextHookEx(g_kbHook, code, wParam, lParam);
+
+    // Alt+F4: close the game gracefully. Handle on key-down only.
+    if (kb->vkCode == VK_F4 && !keyUp &&
+        (GetAsyncKeyState(VK_MENU) & 0x8000)) {
+        if (g_hwnd && IsWindow(g_hwnd))
+            PostMessageW(g_hwnd, WM_SYSCOMMAND, SC_CLOSE, 0);
+        return 1;
+    }
+
+    // Win key: track held state and trigger shell actions directly.
+    // We never inject Win key events — instead we call shell APIs directly
+    // to avoid Windows thinking Win is stuck held.
+    static BOOL s_winHeld   = FALSE;
+    static BOOL s_comboUsed = FALSE;
+
+    if (kb->vkCode == VK_LWIN || kb->vkCode == VK_RWIN) {
+        if (!keyUp) {
+            s_winHeld   = TRUE;
+            s_comboUsed = FALSE;
+        } else {
+            if (s_winHeld && !s_comboUsed) {
+                // Plain Win tap: toggle Start menu.
+                // WM_SYSCOMMAND SC_TASKLIST is the documented way to do this.
+                HWND tray = FindWindowW(L"Shell_TrayWnd", NULL);
+                if (tray) PostMessageW(tray, WM_SYSCOMMAND, SC_TASKLIST, 0);
+            }
+            s_winHeld   = FALSE;
+            s_comboUsed = FALSE;
+        }
+        return 1;  // always swallow Win key from game
+    }
+
+    // Any Win+key combo other than plain Win tap: swallow silently.
+    // We don't attempt to forward combos to the shell — the undocumented
+    // command IDs are version-dependent and unreliable.
+    if (s_winHeld && !keyUp) {
+        s_comboUsed = TRUE;
+        return 1;
+    }
+
+    return CallNextHookEx(g_kbHook, code, wParam, lParam);
+}
+
+static void InstallKeyboardHook()
+{
+    if (g_kbHook) return;
+    // NULL module handle + 0 thread ID = system-wide low-level hook.
+    g_kbHook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, NULL, 0);
+    if (g_kbHook) LOGI("installed low-level keyboard hook");
+    else          LOGE("SetWindowsHookEx(WH_KEYBOARD_LL) failed (%u)", GetLastError());
+}
+
+static void RemoveKeyboardHook()
+{
+    if (!g_kbHook) return;
+    UnhookWindowsHookEx(g_kbHook);
+    g_kbHook = NULL;
+    LOGI("removed low-level keyboard hook");
+}
 
 // ---------------------------------------------------------------------------
 // Style / geometry helpers
@@ -414,12 +539,15 @@ void Win_Attach(HWND hwnd)
         LOGI("EnableWndProcHook=0: geometry is maintained by the watchdog only");
     }
 
+    ApplyDwmHints(hwnd);
+    InstallKeyboardHook();
     Win_Enforce(FALSE);
     StartWatchdog();
 }
 
 void Win_Detach()
 {
+    RemoveKeyboardHook();
     StopWatchdog();
 
     HWND hwnd = g_hwnd;
